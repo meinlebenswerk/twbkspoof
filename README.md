@@ -1,6 +1,6 @@
 # twbkspoof
 A Tweedback survey pen-testing tool
-
+But please be responsible ;)
 ## Usage
 just run node ./main.js
 ## Things you have to set:
