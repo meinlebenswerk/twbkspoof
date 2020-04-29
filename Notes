@@ -1,0 +1,8 @@
+getRoomInfo
+
+obtain sid
+register to the room (sid -> roomid)
+check for right Room
+autheticate!!
+  -> key is called currentToken
+    -> derived from tokenSubject

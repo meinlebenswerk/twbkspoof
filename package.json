@@ -10,6 +10,10 @@
   "author": "meinlebenswerk",
   "license": "ISC",
   "dependencies": {
+    "figlet": "^1.4.0",
+    "jose": "^1.26.1",
+    "request": "^2.88.2",
+    "terminal-kit": "^1.35.2",
     "ws": "^3.2.0"
   }
 }

@@ -1,208 +1,307 @@
-var WebSocket, answers,
-  bind = function(fn, me){ return function(){ return fn.apply(me, arguments); }; };
+// var WebSocket, answers,
+//   bind = function(fn, me){ return function(){ return fn.apply(me, arguments); }; };
+//
+// WebSocket = require('ws');
+//
+// answers = ['y', 'n', 'a', 'b', 'c', 'd', 'e', 'f'];
+//
 
-WebSocket = require('ws');
+const request = require('request');
+const { JWT } = require('jose')
+const WebSocket = require('ws');
 
-answers = ['y', 'n', 'a', 'b', 'c', 'd', 'e', 'f'];
+const WS_PING = '2'
+const WS_PING_RESPONSE = '3'
 
-exports.TWBKInterface = (function() {
-  function TWBKInterface(data) {
-    var error;
-    if (data == null) {
-      data = {
-        url: "",
-        id: "",
-        answerindex: 0,
-        n_votes: 10,
-        method: 0
-      };
-    }
-    this._loginHandler = bind(this._loginHandler, this);
-    this._close = bind(this._close, this);
-    this._voteByReAUTH = bind(this._voteByReAUTH, this);
-    this._socketDataHandler = bind(this._socketDataHandler, this);
-    this._onSocketOpen = bind(this._onSocketOpen, this);
-    this.id = data.id, this.answerindex = data.answerindex, this.n_votes = data.n_votes, this.method = data.method;
-    console.log("attempting to connect to: " + data.url);
-    this.quiz_id = 0;
-    try {
-      this.socket = new WebSocket(data.url);
-    } catch (error1) {
-      error = error1;
-      console.log("error opening WebSocket!");
-    }
-    this.quiz_id = "";
-    this.quiz_type = "yn";
-    this.index = 0;
-    this.vote_run = false;
-    this.tb_session = null;
-    this.socket.on('open', this._onSocketOpen);
+const WS_PROBE = '2probe'
+const WS_PROBE_RESPONSE = '3probe'
+
+const WS_PROBE_ACK = '5'
+const WS_QUERY_RESPONSE = '43'
+
+const ROOM_API_ADDRESS = "https://tweedback.de/api/v1/get-room-info/"
+
+let twbk_timestamp = () => {
+  let alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_".split("")
+  let ts = Date.now()
+
+  let t = ""
+  do {
+    t = alphabet[ts % alphabet.length] + t
+    ts = Math.floor(ts / alphabet.length)
+  } while (ts > 0);
+
+  return t
+}
+
+class TWBKInterface {
+  constructor(session_id, terminal, name){
+    this.terminal = terminal
+    this.id = session_id
+
+    this.name = name || `user#${Math.floor(Math.random() * 10e5)}`
+
+    //Hardcoded to 3 in the TWBK code.
+    this.protocol = 3
+
+    this.sessionInfo = null
+
+    this.sid = null
+    this.pingInterval = null
+    this.pingTimeout = null
+
+    this.ws = null
+    this.wsIntervalTimer = null
+
+    this.quizzes = null
+    this.updateQuizzes = true
+
+    this.token = null
+    this.lastQuery = null
+
+    this.options = null
+    this.nVotes = 0
+
+    terminal('Connecting to TweedbackSession @ %s \n', this.id)
+    this.getSessionInfo().then(this._sessionInfoCallback.bind(this))
   }
 
-  TWBKInterface.prototype._onSocketOpen = function() {
-    console.log("connected to websocket!");
-    this.socket.on('message', this._socketDataHandler);
-    return this._emit("tb_session", {
-      init: true
-    });
-  };
+  getT(){
+    return twbk_timestamp()
+  }
 
-  TWBKInterface.prototype._emit = function(name, data) {
-    var msg, ref;
-    msg = {
-      name: name,
-      data: data,
-      tb_session: this.tb_session
-    };
-    console.log("message: " + msg.name);
-    console.log("session: " + ((ref = this.tb_session) != null ? ref.session_id : void 0));
-    return this.socket.send(JSON.stringify(msg));
-  };
+  NewIdentity(){
+    this.ws.close()
+    clearInterval(this.wsIntervalTimer)
+    this.obtainAuth()
+    .then(this.obtainSID.bind(this))
+    .then(this._joinRoom.bind(this))
+    .then(this.authenticate.bind(this))
+    .then(this.checkAuth.bind(this))
+    .then(this._initWebsocket.bind(this))
+  }
 
-  TWBKInterface.prototype._joinLesson = function() {
-    return this._emit("join_lesson", {
-      lesson_id: this.id,
-      client_info: {
-        browser_name: "Chrome",
-        browser_version: "62.0.3202.62 Safari/537.36",
-        os: "linux",
-        referrer: "",
-        screen_height: 900,
-        screen_width: 1600,
-        user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.62 Safari/537.36"
-      }
-    });
-  };
+  _sessionInfoCallback(sessionInfo){
+    this.sessionInfo = sessionInfo
 
-  TWBKInterface.prototype._initHandler = function(data) {
-    this.tb_session = JSON.parse(data);
-    console.log("tb_session is now: " + data);
-    return this._joinLesson();
-  };
+    let date = new Date(this.sessionInfo.creationDate)
+    this.terminal('Found session with id %s @ %s, which was created at: %s.\n', this.sessionInfo.id, this.sessionInfo.name, date.toString())
+    this.obtainSID().then(this._SIDCallback.bind(this))
+  }
 
-  TWBKInterface.prototype._updateHandler = function(data) {
-    var feature, found, j, len, quiz, ref;
-    if (this.vote_run) {
-      return;
+  getSessionInfo(){
+    return new Promise((resolve, reject) => {
+      request(`https://tweedback.de/api/v1/get-room-info/${this.id}`, (e, r, body) => {
+        let sessionInfo = (!e)? JSON.parse(body) : null
+        resolve(sessionInfo)
+      })
+    })
+  }
+
+  _SIDCallback(info){
+    this._joinRoom()
+    .then(this.obtainAuth.bind(this))
+    .then(this.authenticate.bind(this))
+    // .then(this.checkAuth.bind(this))
+    .then(this._initWebsocket.bind(this))
+  }
+
+  obtainSID(){
+    return new Promise((resolve, reject) => {
+      request(`https://tweedback.de/socket.io/?EIO=3&transport=polling&t=${this.getT()}`, (e, r, body) => {
+        //let sessionInfo = (!e)? JSON.parse(body) : null
+        //resolve(sessionInfo)
+        body = body.match(/({[^}]+})/)[0]
+        let info = JSON.parse(body)
+
+        this.sid = info.sid
+        this.pingInterval = info.pingInterval
+        this.pingTimeout = info.pingTimeout
+
+        resolve(info)
+      })
+    })
+  }
+
+  obtainAuth(){
+    return new Promise((resolve, reject) => {
+      request.post({url:'https://tweedback.de/api/v1/auth'}, (e, r, body) => {
+        let token = JSON.parse(body).token
+        this.token = token
+        resolve()
+      })
+    })
+  }
+
+  _joinRoom(){
+    return new Promise((resolve, reject) => {
+      let url = `https://tweedback.de/socket.io/?EIO=3&transport=polling&t=${this.getT()}&sid=${this.sid}`
+      request.post({url:url, body: `40:40/${this.sessionInfo.id},`, headers: { 'Content-Type': 'text/plain;charset=UTF-8' } }, (e, r, body) => {
+        (body === 'ok')? resolve() : reject()
+      })
+    })
+  }
+
+  authenticate(){
+    let payload_string = `614:42/${this.sessionInfo.id},["authenticate",{"token":"${this.token}"}]`
+
+    return new Promise((resolve, reject) => {
+      let url = `https://tweedback.de/socket.io/?EIO=3&transport=polling&t=${this.getT()}&sid=${this.sid}`
+      request.post({url:url, body: payload_string, headers: { 'Content-Type': 'text/plain;charset=UTF-8' } }, (e, r, body) => {
+        (body === 'ok')? resolve() : reject()
+      })
+    })
+  }
+
+  checkAuth(){
+    return new Promise((resolve, reject) => {
+      request(`https://tweedback.de/socket.io/?EIO=3&transport=polling&t=${this.getT()}&sid=${this.sid}`, (e, r, body) => {
+        (body.length> 20)? resolve() : reject()
+      })
+    })
+  }
+
+  _initWebsocket(){
+    this.ws = new WebSocket(`wss://tweedback.de/socket.io/?EIO=${this.protocol}&transport=websocket&sid=${this.sid}`)
+
+    this.ws.on('open', () => {
+      this.ws.send('2probe')
+      this.wsIntervalTimer = setInterval(this._wsPing.bind(this), this.pingTimeout)
+    })
+
+    this.ws.on('message', this._wsMSGHandler.bind(this));
+
+  }
+
+  _parseOptionNames(name){
+    switch(name){
+      case '__builtin_yes':
+      return 'Yes'
+      case '__builtin_no':
+      return 'No'
+      case '__builtin_a':
+      return 'A'
+      case '__builtin_b':
+      return 'B'
+      case '__builtin_c':
+      return 'C'
+      case '__builtin_d':
+      return 'D'
+      case '__builtin_e':
+      return 'E'
     }
-    quiz = {};
-    found = false;
-    ref = data.data.features;
-    for (j = 0, len = ref.length; j < len; j++) {
-      feature = ref[j];
-      if (feature.feature_id === "quiz") {
-        if (feature.enabled) {
-          found = true;
-          this.quiz_id = feature.data.current.quiz_id;
-          this.quiz_type = feature.data.current.quiz_type;
+    return name
+  }
+
+  _parseQuizzes(quiz_query_data){
+    let parsed = []
+    for(let quizData of quiz_query_data[0].data){
+      let quiz = {
+        id: quizData.id,
+        title: quizData.title,
+        state: quizData.state,
+        options: []
+      }
+
+      for(let option of quizData.voteOptions){
+        let op = {
+          id: option.id,
+          description: this._parseOptionNames(option.description),
+          correct: option.correct,
+          index: option.index
         }
+        quiz.options.push(op)
+      }
+
+      parsed.push(quiz)
+    }
+    return parsed
+  }
+
+  _answerSelected(quiz, err, selected){
+    let idx = selected.selectedIndex
+
+    let answer_id = quiz.options[idx].id
+    let quiz_id = quiz.id
+
+    this.options= {
+      quiz: quiz_id,
+      id: answer_id
+    }
+    this.terminal.green('Starting spoofer, just press CTRL+C to abort.\n')
+    this._wsVote(quiz_id, answer_id)
+  }
+
+  _quizSelected(err, selected){
+    let id = selected.selectedText
+
+    let quiz = this.quizzes.filter(q=> q.title === id || q.id === id)[0]
+    let answers = quiz.options.map(op => op.description? op.description : op.index + `[${op.correct? 'correct' : 'incorrect'}]`)
+
+    this.terminal.green('Selected Quiz %s, choose your answer:\n', id) ;
+
+    this.terminal.singleColumnMenu(answers, this._answerSelected.bind(this, quiz))
+  }
+
+  _wsMSGHandler(msg){
+    // console.log(msg)
+    if(msg === WS_PROBE_RESPONSE){
+      //console.log('received probe response')
+      this.ws.send(WS_PROBE_ACK)
+      if(this.options !== null){
+        this._wsVote(this.options.quiz, this.options.id)
+      }else{
+        this._wsQueryQuizzes()
       }
     }
-    if (!found) {
-      return;
-    }
-    console.log("found active quiz, activating vote-bot");
-    return this._voteHandler();
-  };
 
-  TWBKInterface.prototype._socketDataHandler = function(message) {
-    var data, name, session;
-    message = JSON.parse(message);
-    name = message.name;
-    data = message.data;
-    session = message.session;
-    if (name === "tb_session") {
-      this.session = data;
-      if (this.vote_run) {
-        this._loginHandler();
-      }
-      this._initHandler(data);
+    if(msg === WS_PING_RESPONSE && this.updateQuizzes){
+      this._wsQueryQuizzes()
     }
-    if (name === "update_response" || name === "join_lesson_response") {
-      this._updateHandler(data);
-    }
-    if (name === "quiz:quiz_start") {
-      this.quiz_id = data.quiz_id;
-      return this.quiz_type = data.quiz_type;
-    }
-  };
 
-  TWBKInterface.prototype._voteHandler = function() {
-    this.vote_run = true;
-    switch (this.method) {
-      case 0:
-        this._voteByReplay();
+    let op = msg.slice(0,2)
+    if(op === WS_QUERY_RESPONSE){
+      switch(this.lastQuery){
+        case 'quiz':
+          let data = JSON.parse(msg.match(/(\[[^]+\])/)[0])
+          this.quizzes = this._parseQuizzes(data)
+          if(this.quizzes.length != 0){
+            this.updateQuizzes = false
+          }
+
+          this.terminal.green('Successfully connected to session -> select your quiz:\n' ) ;
+          let options = this.quizzes.filter(q => q.state === 'running').map(q => q.title? q.title : q.id)
+          this.terminal.singleColumnMenu(options, this._quizSelected.bind(this))
         break;
-      case 1:
-        this._voteByReAUTH();
+
+        case 'vote':
+          this.NewIdentity()
         break;
-    }
-  };
-
-  TWBKInterface.prototype._voteByReplay = function() {
-    var i, j, ref, results, socketEvent;
-    results = [];
-    for (i = j = 0, ref = this.n_votes; 0 <= ref ? j < ref : j > ref; i = 0 <= ref ? ++j : --j) {
-      socketEvent = {
-        "feature_id": "quiz",
-        "name": "give_answer",
-        "data": {
-          "quiz_id": this.quiz_id,
-          "answer": answers[this.answerindex]
-        }
-      };
-      results.push(this._emit("feature_event", socketEvent));
-    }
-    return results;
-  };
-
-  TWBKInterface.prototype._voteByReAUTH = function() {
-    this.vote_run = true;
-    console.log("begin reauth");
-    this.index = 0;
-    return this._loginHandler();
-  };
-
-  TWBKInterface.prototype._close = function() {
-
-    /*
-    try
-      @socket.close()
-    catch error
-      console.log "Error closing WebSocket -> this can be ignored"
-     */
-    return process.exit(1);
-  };
-
-  TWBKInterface.prototype._loginHandler = function() {
-    var socketEvent;
-    this.index++;
-    console.log("Index:" + this.index);
-    if (this.index === this.n_votes) {
-      this._close();
-    }
-    socketEvent = {
-      "feature_id": "quiz",
-      "name": "give_answer",
-      "data": {
-        "quiz_id": this.quiz_id,
-        "answer": answers[this.answerindex]
       }
-    };
-    this._emit("feature_event", socketEvent);
-    this.tb_session = null;
-    return this._emit("tb_session", {
-      'init': true
-    });
-  };
-
-  TWBKInterface.prototype._errorHandler = function(error) {
-    if (error == null) {
-      return;
     }
-    return console.log(error);
-  };
 
-  return TWBKInterface;
+  }
 
-})();
+  _wsQueryQuizzes(){
+    let msg = `42/${this.sessionInfo.id},0["action",{"featureId":"quiz","action":{"type":"[Quiz] Get All Quizzes"}}]`
+    console.log('Querying Quizzes.')
+    this.ws.send(msg)
+    this.lastQuery = 'quiz'
+  }
+
+  _wsVote(quiz_id, option_id){
+    let payload = `42/${this.sessionInfo.id},1["action",{"featureId":"quiz","action":{"type":"[Quiz] Vote Quiz","payload":{"quizId":"${quiz_id}","voteOptions":[{"voteOptionId":"${option_id}"}]}}}]`
+    this.ws.send(payload)
+    this.lastQuery = 'vote'
+    this.terminal.green('Sent Vote #%s\n', this.nVotes)
+    this.nVotes++
+  }
+
+  _wsPing(){
+    // console.log('pinging WS')
+    this.ws.send(WS_PING)
+  }
+
+}
+
+module.exports = TWBKInterface
