@@ -29,7 +29,7 @@
 var term = require( 'terminal-kit' ).terminal ;
 const figlet = require('figlet');
 const request = require('request');
-const TWBKInterface = require('./TWBKInterface');
+const TWBKInterface = require('./twbkinterface');
 
 let spoofer_main = (session_id, term) => {
   let _if = new TWBKInterface(session_id, term)
