@@ -8,4 +8,4 @@ Nothing!
 Just run the script, it walks you through everything!
 
 ## Issues:
-None I know of, but if you gind anything, just contact me :)
+None I know of, but if you find anything, just contact me :)
